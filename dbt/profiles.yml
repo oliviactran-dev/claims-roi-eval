@@ -1,0 +1,8 @@
+claims_roi_eval:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('CLAIMS_ROI_DUCKDB', '../data/tuva.duckdb') }}"
+      threads: 4
+      # httpfs is only needed when reading seeds from S3 (no tuva_seed_mirror var)
