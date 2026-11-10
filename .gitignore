@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local data: Tuva DuckDB, seed mirror, analytic outputs
+data/
+reports/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/package-lock.yml
+logs/
+dbt/.user.yml

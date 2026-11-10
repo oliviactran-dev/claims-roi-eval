@@ -7,73 +7,75 @@ study:
   title: Diabetes care management program, simulated enrollment
   question: >
     Does enrolling in care management reduce total cost of care (PMPM) and
-    acute utilization among Medicare FFS members with diabetes, compared with
+    acute utilization among Medicare members with diabetes, compared with
     similar members who did not enroll?
   estimand: ATT            # effect on those who enrolled
-  version: 0.1
+  version: 0.2
   status: draft
 
 data:
-  source: cms_de_synpuf     # CMS 2008-2010 Data Entrepreneurs' Synthetic PUF
-  samples: [1]              # SynPUF has 20 samples; start with sample 1
-  files:
-    beneficiary: [2008, 2009, 2010]
-    claims: [inpatient, outpatient, carrier, pde]
-  study_period: {start: 2008-01-01, end: 2010-12-31}
-  grain: member_month       # canonical analytic layer is member-month plus events
+  # The pipeline reads the Tuva data model, not raw claims. Any claims source
+  # mapped into Tuva's input layer works without code changes.
+  model: tuva
+  source: tuva_demo         # 1,000 synthetic Medicare members, 2016-01 to 2018-12
+  database: data/tuva.duckdb
+  tables:
+    member_months: core.member_months
+    patient: core.patient
+    encounters: core.encounter
+    costs: financial_pmpm.pmpm_prep
+    chronic_conditions: chronic_conditions.cms_chronic_conditions_long
+    risk_scores: cms_hcc.patient_risk_scores_monthly
+  study_period: {start: 2016-01-01, end: 2018-12-31}
+  grain: member_month
 
 eligibility:
   # Applied at the index date (pseudo-index for comparisons)
   age_at_index: {min: 65}
   condition:
     name: diabetes
-    rule: any_of
-    criteria:
-      - beneficiary_flag: SP_DIABETES == 1      # chronic condition flag, 1 = yes
-      - dx_codes: {system: icd9, prefix: ["250"], min_claims: 2, lookback_months: 12}
+    # CMS Chronic Conditions Warehouse definition, as built by Tuva
+    cms_chronic_condition: Diabetes
+    onset_before_index: true
   continuous_enrollment:
-    parts: [A, B]           # HI and SMI coverage months
-    exclude_hmo: true       # FFS only, so claims are complete
     months_before_index: 12
     months_after_index: 12
-    allowed_gap_months: 0
+    allowed_gap_months: 2         # HEDIS-style: up to one missing month per year (demo data has random gaps)
   exclusions:
-    - died_before_index
-    - esrd                  # BENE_ESRD_IND == "Y"
+    - died_before_end_of_follow_up   # keeps the panel balanced for v1
 
 intervention:
   name: care_management_enrollment
-  type: simulated           # SynPUF has no real program; we plant one
+  type: simulated           # the demo data has no real program; we plant one
   anchor_event: enrollment_date
-  index_date_rule: enrollment_date
-  enrollment_window: {start: 2009-01-01, end: 2009-12-31}
+  index_date_rule: first_of_enrollment_month
+  enrollment_window: {start: 2017-01-01, end: 2017-12-31}
   simulation:
     seed: 20261105
-    # Enrollment depends on baseline risk, so a naive comparison is biased.
+    # Every eligible member draws a candidate index month from the window.
+    # Enrollment then depends on baseline risk, so a naive comparison is biased.
     # The pipeline must remove this confounding to recover the true effect.
     selection_model:
-      target_enrollment_rate: 0.15
+      target_enrollment_rate: 0.25   # higher than a real program so n is usable on 1,000 members
       drivers:              # log-odds weights on standardized baseline features
         baseline_ip_admits: 0.6
-        baseline_total_cost: 0.4
+        baseline_total_paid: 0.4
         chronic_condition_count: 0.3
+        hcc_risk_score: 0.3
         age: -0.2
     engagement_simulation:
       tiers_share: {none: 0.25, low: 0.35, high: 0.40}
     planted_effect:
       # Known truth, so the tool can prove it recovers it
-      outcome: total_cost_pmpm
-      relative_change: -0.08        # 8% reduction in follow-up PMPM, as-treated high tier
+      outcome: total_paid_pmpm
       by_engagement_tier: {none: 0.0, low: -0.04, high: -0.12}
-      ip_admits_relative_change: -0.10
       ramp_months: 3                # effect phases in over the first 3 months
 
 comparison:
   pool: eligible_never_enrolled
-  pseudo_index_rule: random_draw_from_enrollee_index_distribution
-  # Gives each comparison member an index date with the same calendar
-  # distribution as enrollees, then re-applies eligibility at that date.
-  reapply_eligibility_at_pseudo_index: true
+  pseudo_index_rule: same_candidate_draw
+  # Comparison members keep their candidate index month as a pseudo-index,
+  # which gives them the same calendar distribution as enrollees.
 
 windows:
   baseline: {start_month: -12, end_month: -1}
@@ -94,23 +96,22 @@ engagement:
     per_protocol: [high]
 
 covariates:
-  demographics: [age, sex, race, state]
-  risk: [chronic_condition_count]   # SynPUF has no HCC scores; count of SP_* flags
-  chronic_conditions: [SP_CHF, SP_COPD, SP_CHRNKIDN, SP_DEPRESSN, SP_ISCHMCHT, SP_STRKETIA, SP_ALZHDMTA, SP_CNCR, SP_OSTEOPRS, SP_RA_OA]
-  prior_utilization: [baseline_ip_admits, baseline_ip_days, baseline_outpatient_visits, baseline_carrier_visits, baseline_rx_fills]
-  prior_cost: [baseline_total_cost, baseline_medical_cost, baseline_rx_cost]
-  baseline_trend: [cost_slope_last_6_months]
+  demographics: [age, sex, race]
+  risk: [hcc_risk_score]            # CMS-HCC blended score from the prior calendar year
+  chronic_conditions: [chronic_condition_count, chf, copd, ckd, ischemic_heart_disease, depression]
+  prior_utilization: [baseline_ip_admits, baseline_ed_visits, baseline_office_visits]
+  prior_cost: [baseline_total_paid, baseline_medical_paid, baseline_pharmacy_paid]
+  baseline_trend: [paid_slope_last_6_months]
 
 outcomes:
   primary:
-    - name: total_cost_pmpm
+    - name: total_paid_pmpm
       type: cost
-      components: [inpatient, outpatient, carrier, pde]
       model: two_part           # logit for any cost, gamma GLM log link for positive cost
   secondary:
     - {name: ip_admits_per_1000, type: count, model: negative_binomial}
-    - {name: ip_days_per_1000, type: count, model: negative_binomial}
-    - {name: rx_cost_pmpm, type: cost, model: two_part}
+    - {name: ed_visits_per_1000, type: count, model: negative_binomial}
+    - {name: pharmacy_paid_pmpm, type: cost, model: two_part}
 
 methods:
   propensity:
@@ -125,24 +126,26 @@ methods:
   did:
     checks: [parallel_trends_plot, event_study_leads, no_anticipation, stable_composition, pre_period_sensitivity]
     errors: cluster_robust
-    cluster: member_id
+    cluster: person_id
   roi:
     program_cost_pmpm: 25.00          # assumed vendor fee, per enrolled member per month
-    savings_basis: total_cost_pmpm
+    savings_basis: total_paid_pmpm
     ci_method: bootstrap
     bootstrap_reps: 1000
     report: [gross_savings_pmpm, net_savings_pmpm, roi_ratio, ci_95]
 
 outputs:
-  analytic_file: data/analytic/dm_care_mgmt_v1_cohort.parquet     # one row per member, index date, group
-  member_month_file: data/analytic/dm_care_mgmt_v1_member_month.parquet
-  baseline_features: data/analytic/dm_care_mgmt_v1_baseline.parquet
+  dir: data/analytic
+  cohort: cohort.parquet                # one row per member: index date, group, engagement tier
+  member_month: member_month.parquet    # relative-month panel, -12 to +11
+  baseline_features: baseline.parquet
+  truth: truth.json                     # planted effect, kept apart from analysis inputs
   report: reports/dm_care_mgmt_v1.html
 
 validation:
   # Pass if the pipeline's estimate lands near the planted truth
   recover_truth:
-    outcome: total_cost_pmpm
+    outcome: total_paid_pmpm
     population: as_treated
     tolerance_relative: 0.25          # within 25% of the planted effect
     naive_estimate_should_differ: true  # shows confounding was real
